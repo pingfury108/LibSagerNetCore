@@ -2,7 +2,9 @@ package libcore
 
 import "C"
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
@@ -75,6 +77,125 @@ type TunConfig struct {
 
 type ErrorHandler interface {
 	HandleError(err string)
+}
+
+// sniffDomain extracts the effective domain from the first payload bytes.
+// v2ray's Dispatcher.DispatchConn only sniffs successfully when data is already
+// buffered, which never happens for tun connections (the client waits for our
+// SYN-ACK), so core-side sniffing silently no-ops and only IP rules apply.
+func sniffDomain(b []byte) string {
+	if d := sniffTLSServerName(b); d != "" {
+		return d
+	}
+	return sniffHTTPHost(b)
+}
+
+func sniffTLSServerName(b []byte) string {
+	if len(b) < 9 || b[0] != 0x16 || b[1] != 0x03 {
+		return ""
+	}
+	if len(b) < 5 || b[5] != 0x01 { // ClientHello
+		return ""
+	}
+	hsLen := int(b[6])<<16 | int(b[7])<<8 | int(b[8])
+	p := b[9:]
+	if len(p) > hsLen {
+		p = p[:hsLen]
+	}
+	if len(p) < 34 {
+		return ""
+	}
+	p = p[34:] // version(2) + random(32)
+	if len(p) < 1 {
+		return ""
+	}
+	if n := int(p[0]); len(p) >= 1+n {
+		p = p[1+n:] // session id
+	} else {
+		return ""
+	}
+	if len(p) < 2 {
+		return ""
+	}
+	if n := int(binary.BigEndian.Uint16(p)); len(p) >= 2+n {
+		p = p[2+n:] // cipher suites
+	} else {
+		return ""
+	}
+	if len(p) < 1 {
+		return ""
+	}
+	if n := int(p[0]); len(p) >= 1+n {
+		p = p[1+n:] // compression methods
+	} else {
+		return ""
+	}
+	if len(p) < 2 {
+		return ""
+	}
+	if n := int(binary.BigEndian.Uint16(p)); len(p) >= 2+n {
+		p = p[2 : 2+n] // extensions
+	} else {
+		return ""
+	}
+	for len(p) >= 4 {
+		etype := binary.BigEndian.Uint16(p)
+		elen := int(binary.BigEndian.Uint16(p[2:4]))
+		p = p[4:]
+		if len(p) < elen {
+			return ""
+		}
+		if etype == 0 { // server_name
+			d := p[:elen]
+			if len(d) >= 5 {
+				nameLen := int(binary.BigEndian.Uint16(d[3:5]))
+				if len(d) >= 5+nameLen {
+					return string(d[5 : 5+nameLen])
+				}
+			}
+			return ""
+		}
+		p = p[elen:]
+	}
+	return ""
+}
+
+func sniffHTTPHost(b []byte) string {
+	lower := bytes.ToLower(b)
+	if i := bytes.Index(lower, []byte("\nhost:")); i >= 0 {
+		rest := b[i+6:]
+		rest = bytes.TrimLeft(rest, " \t")
+		if j := bytes.IndexAny(rest, "\r\n"); j > 0 {
+			return string(rest[:j])
+		}
+	}
+	if !bytes.HasPrefix(b, []byte("CONNECT ")) {
+		return ""
+	}
+	if i := bytes.IndexByte(b, ' '); i > 8 {
+		if j := bytes.IndexByte(b[i+1:], ' '); j > 0 {
+			host := string(b[i+1 : i+1+j])
+			if k := bytes.IndexByte([]byte(host), ':'); k > 0 {
+				return host[:k]
+			}
+			return host
+		}
+	}
+	return ""
+}
+
+type replayConn struct {
+	net.Conn
+	prefix []byte
+}
+
+func (c *replayConn) Read(b []byte) (int, error) {
+	if len(c.prefix) > 0 {
+		n := copy(b, c.prefix)
+		c.prefix = c.prefix[n:]
+		return n, nil
+	}
+	return c.Conn.Read(b)
 }
 
 func NewTun2ray(config *TunConfig) (*Tun2ray, error) {
@@ -211,7 +332,6 @@ func (t *Tun2ray) NewConnection(source v2rayNet.Destination, destination v2rayNe
 
 	ctx := core.WithContext(context.Background(), t.v2ray.core)
 	ctx = session.ContextWithInbound(ctx, inbound)
-
 	if !isDns && t.sniffing {
 		req := session.SniffingRequest{
 			Enabled:   true,
@@ -265,6 +385,37 @@ func (t *Tun2ray) NewConnection(source v2rayNet.Destination, destination v2rayNe
 		}()
 	}
 	inbound.Conn = conn
+
+	if t.sniffing && !isDns {
+		deadline := time.Now().Add(120 * time.Millisecond)
+		_ = conn.SetReadDeadline(deadline)
+		probe := make([]byte, 4096)
+		n, _ := conn.Read(probe)
+		_ = conn.SetReadDeadline(time.Time{})
+		if n > 0 {
+			conn = &replayConn{Conn: conn, prefix: probe[:n]}
+			if domain := sniffDomain(probe[:n]); domain != "" {
+				if t.v2ray.router != nil {
+					routeTarget := v2rayNet.Destination{
+						Network: destination.Network,
+						Address: v2rayNet.ParseAddress(domain),
+						Port:    destination.Port,
+					}
+					routingCtx := &routing_session.Context{
+						Inbound:  inbound,
+						Outbound: &session.Outbound{Target: destination, RouteTarget: routeTarget},
+						Content:  session.ContentFromContext(ctx),
+					}
+					route, routeErr := t.v2ray.router.PickRoute(routingCtx)
+					if routeErr == nil {
+						tag := route.GetOutboundTag()
+						logrus.Debugf("routed %s:%d by domain %s -> %s", destination.Address, destination.Port, domain, tag)
+						ctx = session.SetForcedOutboundTagToContext(ctx, tag)
+					}
+				}
+			}
+		}
+	}
 
 	_ = t.v2ray.dispatcher.DispatchConn(ctx, destination, conn, true)
 }
