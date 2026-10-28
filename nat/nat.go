@@ -59,10 +59,20 @@ func (t *SystemTun) dispatchLoop() {
 	// close it (finalizer / RemoveConnection). Once that stray close happens
 	// after the number is reused it kills an unrelated fd - typically the tcp
 	// forwarder listener, which then fails with "accept: invalid argument".
+	// The fd is O_NONBLOCK (VpnService hands it out that way), so a plain
+	// read returns EAGAIN when no packet is queued: wait for readability
+	// first, otherwise the loop would exit and the whole tunnel go silent.
+	pollFds := []unix.PollFd{{Fd: int32(t.dev), Events: unix.POLLIN}}
 	for {
+		if _, err := unix.Poll(pollFds, -1); err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			break
+		}
 		n, err := unix.Read(t.dev, data)
 		if err != nil {
-			if err == unix.EINTR {
+			if err == unix.EINTR || err == unix.EAGAIN {
 				continue
 			}
 			break
