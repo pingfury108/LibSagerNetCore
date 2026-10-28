@@ -3,6 +3,7 @@ package nat
 import (
 	"errors"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/Dreamacro/clash/common/cache"
@@ -15,14 +16,16 @@ import (
 
 type tcpForwarder struct {
 	tun      *SystemTun
+	access   sync.Mutex
 	port     uint16
 	listener *net.TCPListener
+	closed   bool
 	sessions *cache.LruCache
 }
 
-func newTcpForwarder(tun *SystemTun) (*tcpForwarder, error) {
+func listenTcpForwarder(tun *SystemTun, port uint16) (*net.TCPListener, error) {
 	var network string
-	address := &net.TCPAddr{}
+	address := &net.TCPAddr{Port: int(port)}
 	if tun.ipv6Mode == comm.IPv6Disable {
 		network = "tcp4"
 		address.IP = net.IP(vlanClient4)
@@ -30,21 +33,62 @@ func newTcpForwarder(tun *SystemTun) (*tcpForwarder, error) {
 		network = "tcp"
 		address.IP = net.IPv6zero
 	}
-	listener, err := net.ListenTCP(network, address)
+	return net.ListenTCP(network, address)
+}
+
+func newTcpForwarder(tun *SystemTun) (*tcpForwarder, error) {
+	listener, err := listenTcpForwarder(tun, 0)
 	if err != nil {
-		return nil, newError("failed to create tcp forwarder at ", address.IP).Base(err)
+		return nil, newError("failed to create tcp forwarder").Base(err)
 	}
 	addr := listener.Addr().(*net.TCPAddr)
 	port := uint16(addr.Port)
 	newError("tcp forwarder started at ", addr).AtDebug().WriteToLog()
-	return &tcpForwarder{tun, port, listener, cache.NewLRUCache(
-		cache.WithAge(300),
-		cache.WithUpdateAgeOnGet(),
-	)}, nil
+	return &tcpForwarder{
+		tun:      tun,
+		port:     port,
+		listener: listener,
+		sessions: cache.NewLRUCache(
+			cache.WithAge(300),
+			cache.WithUpdateAgeOnGet(),
+		),
+	}, nil
+}
+
+// accept takes the current listener safely (it can be swapped by relisten).
+func (t *tcpForwarder) accept() (*net.TCPConn, error) {
+	t.access.Lock()
+	listener := t.listener
+	closed := t.closed
+	t.access.Unlock()
+	if closed || listener == nil {
+		return nil, net.ErrClosed
+	}
+	return listener.AcceptTCP()
+}
+
+// relisten replaces the listener after a socket-level failure. The same port is
+// reused so the packet rewriting in processIPv4/processIPv6 keeps working.
+func (t *tcpForwarder) relisten() error {
+	t.access.Lock()
+	defer t.access.Unlock()
+	if t.closed {
+		return net.ErrClosed
+	}
+	if t.listener != nil {
+		_ = t.listener.Close()
+		t.listener = nil
+	}
+	listener, err := listenTcpForwarder(t.tun, t.port)
+	if err != nil {
+		return err
+	}
+	t.listener = listener
+	return nil
 }
 
 func (t *tcpForwarder) dispatch() (bool, error) {
-	conn, err := t.listener.AcceptTCP()
+	conn, err := t.accept()
 	if err != nil {
 		return true, err
 	}
@@ -83,18 +127,35 @@ func (t *tcpForwarder) dispatch() (bool, error) {
 }
 
 func (t *tcpForwarder) dispatchLoop() {
+	var failures int
 	for {
 		stop, err := t.dispatch()
-		if err != nil {
-			e := newError("dispatch tcp conn failed").Base(err)
+		if err == nil {
+			failures = 0
+			continue
+		}
+		if !stop {
+			// non fatal (e.g. dropped unknown session)
+			continue
+		}
+		if errors.Is(err, net.ErrClosed) {
+			return
+		}
+		failures++
+		e := newError("dispatch tcp conn failed").Base(err)
+		if failures >= 5 {
 			e.WriteToLog()
-			if stop {
-				if !errors.Is(err, net.ErrClosed) {
-					t.Close()
-					t.tun.errorHandler(e.String())
-				}
-				return
-			}
+			t.Close()
+			t.tun.errorHandler(e.String())
+			return
+		}
+		// A stray close of the listener fd (see dispatchLoop in nat.go) shows up
+		// here as EINVAL/EBADF. Rebinding the same port recovers the tunnel
+		// instead of tearing down the whole VPN for a single transient error.
+		e.AtDebug().WriteToLog()
+		time.Sleep(time.Duration(failures) * 100 * time.Millisecond)
+		if rerr := t.relisten(); rerr != nil {
+			newError("failed to rebind tcp forwarder").Base(rerr).AtDebug().WriteToLog()
 		}
 	}
 }
@@ -195,5 +256,13 @@ func (t *tcpForwarder) processIPv6(ipHdr header.IPv6, tcpHdr header.TCP) {
 }
 
 func (t *tcpForwarder) Close() error {
-	return t.listener.Close()
+	t.access.Lock()
+	defer t.access.Unlock()
+	t.closed = true
+	if t.listener == nil {
+		return nil
+	}
+	err := t.listener.Close()
+	t.listener = nil
+	return err
 }

@@ -1,10 +1,7 @@
 package nat
 
 import (
-	"os"
-
 	"github.com/v2fly/v2ray-core/v5/common/buf"
-	v2rayNet "github.com/v2fly/v2ray-core/v5/common/net"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
@@ -57,13 +54,20 @@ func (t *SystemTun) dispatchLoop() {
 	defer cache.Release()
 	data := cache.Use()
 
-	device := os.NewFile(uintptr(t.dev), "tun")
-	element := v2rayNet.AddConnection(device)
-	defer v2rayNet.RemoveConnection(element)
-
+	// The tun fd belongs to the caller (Android VpnService). Never wrap it in
+	// os.File or hand it to v2rayNet.AddConnection: both take ownership and will
+	// close it (finalizer / RemoveConnection). Once that stray close happens
+	// after the number is reused it kills an unrelated fd - typically the tcp
+	// forwarder listener, which then fails with "accept: invalid argument".
 	for {
-		n, err := device.Read(data)
+		n, err := unix.Read(t.dev, data)
 		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			break
+		}
+		if n == 0 {
 			break
 		}
 		cache.Clear()
